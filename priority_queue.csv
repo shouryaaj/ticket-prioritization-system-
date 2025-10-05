@@ -1,0 +1,5 @@
+text,predicted_priority,urgency_rank,timestamp
+"Unauthorized transactions on my account worth 10000 dollars
+ ",high,2,2025-10-05T18:09:10.479495
+"SERVER DOWN for region EU, payments failing immediately!!",medium,1,2025-10-05T18:04:58.918095
+I am unable to log into my account,medium,1,2025-10-05T18:12:21.437034
