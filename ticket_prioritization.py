@@ -22,6 +22,16 @@ DATASET_URL = (
 )
 PRIORITY_QUEUE_PATH = "priority_queue.csv"
 
+# Valid ticket statuses and their transitions
+VALID_STATUSES = ["new", "in_progress", "resolved", "closed", "cancelled"]
+STATUS_TRANSITIONS = {
+    "new": ["in_progress", "cancelled"],
+    "in_progress": ["resolved", "cancelled"],
+    "resolved": ["closed", "in_progress"],  # can reopen if issue persists
+    "closed": [],  # terminal state
+    "cancelled": []  # terminal state
+}
+
 
 def fetch_rows(offset: int, length: int) -> List[dict]:
     response = requests.get(DATASET_URL, params={"offset": offset, "length": length}, timeout=60)
@@ -130,11 +140,15 @@ def append_to_priority_queue(text: str, predicted_label: str, queue_path: str = 
         "predicted_priority": predicted_label,
         "urgency_rank": get_urgency_rank(predicted_label),
         "timestamp": timestamp,
+        "status": "new",
+        "assigned_to": "",
+        "notes": "",
+        "updated_at": timestamp,
     }
     if os.path.exists(queue_path):
         queue_df = pd.read_csv(queue_path)
     else:
-        queue_df = pd.DataFrame(columns=["text", "predicted_priority", "urgency_rank", "timestamp"])
+        queue_df = pd.DataFrame(columns=["text", "predicted_priority", "urgency_rank", "timestamp", "status", "assigned_to", "notes", "updated_at"])
     queue_df = pd.concat([queue_df, pd.DataFrame([new_row])], ignore_index=True)
     # Sort: highest urgency_rank first, then oldest timestamp first
     queue_df = queue_df.sort_values(by=["urgency_rank", "timestamp"], ascending=[False, True]).reset_index(drop=True)
@@ -147,13 +161,78 @@ def print_queue_summary(queue_path: str = PRIORITY_QUEUE_PATH) -> None:
         print("Queue is empty.")
         return
     qdf = pd.read_csv(queue_path)
-    order = ["critical", "high", "medium", "low"]
-    for pr in order:
-        subset = qdf[qdf["predicted_priority"].str.lower() == pr]
-        print(f"\n{pr.title()} ({len(subset)})")
-        for _, row in subset.head(10).iterrows():
-            text = row["text"]
-            print(f" - {text[:120]}{'...' if len(text)>120 else ''}")
+    # Group by status first, then priority
+    for status in VALID_STATUSES:
+        status_subset = qdf[qdf["status"].str.lower() == status]
+        if status_subset.empty:
+            continue
+        print(f"\n{status.upper()} ({len(status_subset)})")
+        order = ["critical", "high", "medium", "low"]
+        for pr in order:
+            subset = status_subset[status_subset["predicted_priority"].str.lower() == pr]
+            if subset.empty:
+                continue
+            print(f"  {pr.title()} ({len(subset)})")
+            for _, row in subset.head(5).iterrows():
+                text = row["text"]
+                assigned = f" → {row['assigned_to']}" if row['assigned_to'] else ""
+                print(f"    - {text[:100]}{'...' if len(text)>100 else ''}{assigned}")
+
+
+def update_ticket_status(ticket_id: int, new_status: str, assigned_to: str = "", notes: str = "", queue_path: str = PRIORITY_QUEUE_PATH) -> bool:
+    """Update ticket status with validation."""
+    if not os.path.exists(queue_path):
+        print("Queue file not found.")
+        return False
+    
+    qdf = pd.read_csv(queue_path)
+    if ticket_id < 0 or ticket_id >= len(qdf):
+        print(f"Invalid ticket ID: {ticket_id}")
+        return False
+    
+    current_status = qdf.iloc[ticket_id]["status"].lower()
+    new_status = new_status.lower()
+    
+    if new_status not in VALID_STATUSES:
+        print(f"Invalid status: {new_status}. Valid options: {', '.join(VALID_STATUSES)}")
+        return False
+    
+    if new_status not in STATUS_TRANSITIONS.get(current_status, []):
+        print(f"Cannot transition from {current_status} to {new_status}")
+        print(f"Valid transitions from {current_status}: {STATUS_TRANSITIONS.get(current_status, [])}")
+        return False
+    
+    # Update the ticket
+    qdf.iloc[ticket_id, qdf.columns.get_loc("status")] = new_status
+    if assigned_to:
+        qdf.iloc[ticket_id, qdf.columns.get_loc("assigned_to")] = assigned_to
+    if notes:
+        qdf.iloc[ticket_id, qdf.columns.get_loc("notes")] = notes
+    qdf.iloc[ticket_id, qdf.columns.get_loc("updated_at")] = datetime.utcnow().isoformat()
+    
+    qdf.to_csv(queue_path, index=False)
+    print(f"Ticket {ticket_id} updated: {current_status} → {new_status}")
+    return True
+
+
+def list_tickets_by_status(status: str = "", queue_path: str = PRIORITY_QUEUE_PATH) -> None:
+    """List tickets filtered by status."""
+    if not os.path.exists(queue_path):
+        print("Queue file not found.")
+        return
+    
+    qdf = pd.read_csv(queue_path)
+    if status:
+        qdf = qdf[qdf["status"].str.lower() == status.lower()]
+    
+    if qdf.empty:
+        print(f"No tickets found with status: {status}")
+        return
+    
+    print(f"\nTickets ({len(qdf)} total):")
+    for idx, row in qdf.iterrows():
+        assigned = f" → {row['assigned_to']}" if row['assigned_to'] else ""
+        print(f"[{idx}] {row['status'].upper()} | {row['predicted_priority'].upper()} | {row['text'][:80]}{'...' if len(row['text'])>80 else ''}{assigned}")
 
 
 class PriorityModel:
@@ -197,6 +276,8 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true", help="Disable plotting")
     parser.add_argument("--new-ticket", type=str, default=None, help="New ticket text to classify and enqueue")
     parser.add_argument("--interactive", action="store_true", help="Interactive console mode to classify and queue tickets")
+    parser.add_argument("--list", type=str, default="", help="List tickets by status (new, in_progress, resolved, closed, cancelled)")
+    parser.add_argument("--update", type=str, default="", help="Update ticket status: format 'id:status:assigned_to:notes'")
     args = parser.parse_args()
 
     print("Loading dataset from Hugging Face datasets-server ...")
@@ -263,10 +344,33 @@ def main() -> None:
         for i, row in queue_df.head(10).iterrows():
             print(f"[{row['predicted_priority']}] {row['text'][:120]}{'...' if len(row['text'])>120 else ''}")
 
+    # Handle list command
+    if args.list:
+        list_tickets_by_status(args.list)
+        return
+
+    # Handle update command
+    if args.update:
+        parts = args.update.split(":")
+        if len(parts) < 2:
+            print("Update format: id:status:assigned_to:notes")
+            return
+        ticket_id = int(parts[0])
+        status = parts[1]
+        assigned_to = parts[2] if len(parts) > 2 else ""
+        notes = parts[3] if len(parts) > 3 else ""
+        update_ticket_status(ticket_id, status, assigned_to, notes)
+        return
+
     # Interactive mode
     if args.interactive:
         print("\nEntering interactive mode. Type a ticket and press Enter.")
-        print("Commands: /q to quit, /s to show queue summary")
+        print("Commands:")
+        print("  /q to quit")
+        print("  /s to show queue summary")
+        print("  /l [status] to list tickets by status")
+        print("  /u id:status:assigned_to:notes to update ticket")
+        print("  /help for more info")
         while True:
             try:
                 line = input("> ").strip()
@@ -278,8 +382,31 @@ def main() -> None:
             if line in {"/q", "/quit", ":q"}:
                 print("Bye.")
                 break
+            if line in {"/help", "/h"}:
+                print("Commands:")
+                print("  /q to quit")
+                print("  /s to show queue summary")
+                print("  /l [status] to list tickets by status")
+                print("  /u id:status:assigned_to:notes to update ticket")
+                print("  Just type ticket text to add it")
+                continue
             if line in {"/s", "/show", ":s"}:
                 print_queue_summary()
+                continue
+            if line.startswith("/l"):
+                status = line.split(" ", 1)[1] if " " in line else ""
+                list_tickets_by_status(status)
+                continue
+            if line.startswith("/u"):
+                parts = line.split(" ", 1)[1].split(":") if " " in line else []
+                if len(parts) >= 2:
+                    ticket_id = int(parts[0])
+                    status = parts[1]
+                    assigned_to = parts[2] if len(parts) > 2 else ""
+                    notes = parts[3] if len(parts) > 3 else ""
+                    update_ticket_status(ticket_id, status, assigned_to, notes)
+                else:
+                    print("Update format: /u id:status:assigned_to:notes")
                 continue
             predicted = assign_priority(line)
             append_to_priority_queue(line, predicted)
